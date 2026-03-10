@@ -18,6 +18,17 @@ dotenv.config();
 
 const app = express();
 
+// CORS must be first - before any other middleware
+app.use(cors({
+    origin: true,
+    credentials: true,
+}));
+app.use(helmet({
+    crossOriginResourcePolicy: false,
+}));
+app.use(express.json());
+app.use(morgan('dev'));
+
 // Connect to database on every request (cached for serverless)
 app.use(async (req, res, next) => {
     try {
@@ -27,14 +38,6 @@ app.use(async (req, res, next) => {
         res.status(500).json({ message: 'Database connection failed' });
     }
 });
-
-// Middleware
-app.use(express.json());
-app.use(cors());
-app.use(helmet({
-    crossOriginResourcePolicy: false,
-}));
-app.use(morgan('dev'));
 
 // Routes
 app.use('/api/users', userRoutes);
