@@ -1,4 +1,5 @@
 const asyncHandler = require('express-async-handler');
+const { validationResult } = require('express-validator');
 const generateToken = require('../utils/generateToken');
 const User = require('../models/User');
 
@@ -6,28 +7,40 @@ const User = require('../models/User');
 // @route   POST /api/users/login
 // @access  Public
 const authUser = asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
     const { email, password } = req.body;
 
     const user = await User.findOne({ email });
 
-    if (user && (await user.matchPassword(password))) {
-        res.json({
-            _id: user._id,
-            name: user.name,
-            email: user.email,
-            role: user.role,
-            token: generateToken(user._id),
-        });
-    } else {
-        res.status(401);
-        throw new Error('Invalid email or password');
+    if (!user) {
+        return res.status(401).json({ error: 'Email not found' });
     }
+
+    const isMatch = await user.matchPassword(password);
+    if (!isMatch) {
+        return res.status(401).json({ error: 'Incorrect password' });
+    }
+
+    res.json({
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        token: generateToken(user._id),
+    });
 });
 
 // @desc    Register a new user
 // @route   POST /api/users
 // @access  Public
 const registerUser = asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
     const { name, email, password, role } = req.body;
 
     const userExists = await User.findOne({ email });
@@ -85,17 +98,17 @@ const getUserProfile = asyncHandler(async (req, res) => {
 // @desc    Update user profile
 // @route   PUT /api/users/profile
 // @access  Private
-const updateUserProfile = asyncHandler(async (req, res) => {
-    const user = await User.findById(req.user._id);
+const updateUserProfile = async (req, res) => {
+    try {
+        const updatedUser = await User.findByIdAndUpdate(
+            req.user._id,
+            { name: req.body.name },
+            { new: true, runValidators: true }
+        ).select('-password');
 
-    if (user) {
-        user.name = req.body.name || user.name;
-        user.email = req.body.email || user.email;
-        if (req.body.password) {
-            user.password = req.body.password;
+        if (!updatedUser) {
+            return res.status(404).json({ message: 'User not found' });
         }
-
-        const updatedUser = await user.save();
 
         res.json({
             _id: updatedUser._id,
@@ -104,11 +117,10 @@ const updateUserProfile = asyncHandler(async (req, res) => {
             role: updatedUser.role,
             token: generateToken(updatedUser._id),
         });
-    } else {
-        res.status(404);
-        throw new Error('User not found');
+    } catch (error) {
+        res.status(500).json({ message: error.message });
     }
-});
+};
 
 // @desc    Get all users
 // @route   GET /api/users

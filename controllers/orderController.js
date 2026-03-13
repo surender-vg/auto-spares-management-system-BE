@@ -1,57 +1,95 @@
 const asyncHandler = require('express-async-handler');
 const Order = require('../models/Order');
+const Product = require('../models/Product');
 
 // @desc    Create new order
 // @route   POST /api/orders
 // @access  Private
-const addOrderItems = asyncHandler(async (req, res) => {
-    const {
-        orderItems,
-        shippingAddress,
-        paymentMethod,
-        itemsPrice,
-        taxPrice,
-        shippingPrice,
-        totalPrice,
-    } = req.body;
+const { validationResult } = require('express-validator');
+const addOrderItems = async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
+        }
+        const {
+            orderItems,
+            shippingAddress,
+            paymentMethod,
+            itemsPrice,
+            taxPrice,
+            shippingPrice,
+            totalPrice,
+        } = req.body;
 
-    if (!orderItems || orderItems.length === 0) {
-        res.status(400);
-        throw new Error('No order items');
-    }
-
-    const normalizedItems = orderItems.map((item) => {
-        const productId = item.product || item._id;
-        if (!productId) {
-            res.status(400);
-            throw new Error('Order item is missing product id');
+        if (!orderItems || orderItems.length === 0) {
+            return res.status(400).json({ message: 'No order items' });
         }
 
-        return {
-            name: item.name,
-            qty: Number(item.qty),
-            image: item.image,
-            price: Number(item.price),
-            product: productId,
-        };
-    });
+        if (shippingAddress && shippingAddress.phone && (!/^\d{10}$/.test(shippingAddress.phone))) {
+            return res.status(400).json({ message: 'Shipping phone number must be exactly 10 digits' });
+        }
 
-    const order = new Order({
-        orderItems: normalizedItems,
-        user: req.user._id,
-        shippingAddress,
-        paymentMethod,
-        itemsPrice: Number(itemsPrice),
-        taxPrice: Number(taxPrice),
-        shippingPrice: Number(shippingPrice),
-        totalPrice: Number(totalPrice),
-        status: 'Processing',
-    });
+        const normalizedItems = orderItems.map((item) => {
+            const productId = item.product || item._id;
+            if (!productId) throw new Error('Order item is missing product id');
+            return {
+                name: item.name,
+                qty: Number(item.qty),
+                image: item.image,
+                price: Number(item.price),
+                product: productId,
+            };
+        });
 
-    const createdOrder = await order.save();
+        // Validate stock availability for all items before creating the order
+        const stockErrors = [];
+        await Promise.all(
+            normalizedItems.map(async (item) => {
+                const product = await Product.findById(item.product);
+                if (!product) {
+                    stockErrors.push(`Product not found`);
+                } else if (product.countInStock < item.qty) {
+                    stockErrors.push(
+                        product.countInStock === 0
+                            ? `"${product.name}" is out of stock`
+                            : `Only ${product.countInStock} unit(s) of "${product.name}" available`
+                    );
+                }
+            })
+        );
+        if (stockErrors.length > 0) {
+            return res.status(400).json({ message: stockErrors.join('. ') });
+        }
 
-    res.status(201).json(createdOrder);
-});
+        const order = await Order.create({
+            orderItems: normalizedItems,
+            user: req.user._id,
+            shippingAddress,
+            paymentMethod,
+            itemsPrice: Number(itemsPrice),
+            taxPrice: Number(taxPrice),
+            shippingPrice: Number(shippingPrice),
+            totalPrice: Number(totalPrice),
+            status: 'Processing',
+        });
+
+        // Decrement stock for each ordered item
+        await Promise.all(
+            normalizedItems.map(item =>
+                Product.findByIdAndUpdate(
+                    item.product,
+                    { $inc: { countInStock: -item.qty } },
+                    { new: true }
+                )
+            )
+        );
+
+        res.status(201).json(order);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
 
 // @desc    Get order by ID
 // @route   GET /api/orders/:id
@@ -118,43 +156,60 @@ const updateOrderToDelivered = asyncHandler(async (req, res) => {
 // @desc    Update order status (4-stage: Processing → Shipped → Out for Delivery → Delivered)
 // @route   PUT /api/orders/:id/status
 // @access  Private/Admin/Staff
-const updateOrderStatus = asyncHandler(async (req, res) => {
-    const order = await Order.findById(req.params.id);
+const updateOrderStatus = async (req, res) => {
+    try {
+        const order = await Order.findById(req.params.id);
 
-    if (!order) {
-        res.status(404);
-        throw new Error('Order not found');
-    }
-
-    const { status } = req.body;
-    const validStatuses = ['Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'];
-
-    if (!status || !validStatuses.includes(status)) {
-        res.status(400);
-        throw new Error('Invalid status. Must be one of: Processing, Shipped, Out for Delivery, Delivered, Cancelled');
-    }
-
-    order.status = status;
-
-    // Automatically mark as delivered when status is 'Delivered'
-    if (status === 'Delivered') {
-        order.isDelivered = true;
-        order.deliveredAt = Date.now();
-
-        // Auto-mark COD orders as paid on delivery
-        if (order.paymentMethod === 'Cash on Delivery' && !order.isPaid) {
-            order.isPaid = true;
-            order.paidAt = Date.now();
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
         }
-    } else {
-        order.isDelivered = false;
-        order.deliveredAt = undefined;
-    }
 
-    const updatedOrder = await order.save();
-    const populatedOrder = await Order.findById(updatedOrder._id).populate('user', 'id name');
-    res.json(populatedOrder);
-});
+        const { status } = req.body;
+        const validStatuses = ['Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'];
+
+        if (!status || !validStatuses.includes(status)) {
+            return res.status(400).json({ message: 'Invalid status' });
+        }
+
+        const updateFields = { status };
+
+        if (status === 'Delivered') {
+            updateFields.isDelivered = true;
+            updateFields.deliveredAt = Date.now();
+            // Auto-mark COD orders as paid on delivery
+            if (order.paymentMethod === 'Cash on Delivery' && !order.isPaid) {
+                updateFields.isPaid = true;
+                updateFields.paidAt = Date.now();
+            }
+        } else if (status === 'Cancelled') {
+            updateFields.isDelivered = false;
+            updateFields.deliveredAt = undefined;
+            // Restore stock when admin cancels
+            await Promise.all(
+                order.orderItems.map(item =>
+                    Product.findByIdAndUpdate(
+                        item.product,
+                        { $inc: { countInStock: item.qty } },
+                        { new: true }
+                    )
+                )
+            );
+        } else {
+            updateFields.isDelivered = false;
+            updateFields.deliveredAt = undefined;
+        }
+
+        const updatedOrder = await Order.findByIdAndUpdate(
+            req.params.id,
+            updateFields,
+            { new: true }
+        ).populate('user', 'id name');
+
+        res.json(updatedOrder);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
 
 // @desc    Get logged in user orders
 // @route   GET /api/orders/myorders
@@ -172,6 +227,52 @@ const getOrders = asyncHandler(async (req, res) => {
     res.json(orders);
 });
 
+// @desc    Cancel order by user
+// @route   PUT /api/orders/:id/cancel
+// @access  Private (only order owner)
+const cancelOrder = async (req, res) => {
+    try {
+        const order = await Order.findById(req.params.id);
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        if (order.status === 'Cancelled') {
+            return res.status(400).json({ message: 'Order is already cancelled' });
+        }
+        if (order.status === 'Delivered') {
+            return res.status(400).json({ message: 'Delivered orders cannot be cancelled' });
+        }
+        
+        // Allow admin/staff to cancel any order; users can only cancel their own
+        const isAdminOrStaff = req.user.role === 'admin' || req.user.role === 'staff';
+        if (!isAdminOrStaff && order.user.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ message: 'Not authorized to cancel this order' });
+        }
+        
+        const updatedOrder = await Order.findByIdAndUpdate(
+            req.params.id,
+            { status: 'Cancelled' },
+            { new: true }
+        );
+
+        // Restore stock for each item in the cancelled order
+        await Promise.all(
+            order.orderItems.map(item =>
+                Product.findByIdAndUpdate(
+                    item.product,
+                    { $inc: { countInStock: item.qty } },
+                    { new: true }
+                )
+            )
+        );
+        
+        res.json({ message: 'Order cancelled successfully', order: updatedOrder });
+    } catch (error) {
+        console.error('Cancel order error:', error.message);
+        res.status(500).json({ message: error.message || 'Failed to cancel order' });
+    }
+};
+
 module.exports = {
     addOrderItems,
     getOrderById,
@@ -180,4 +281,5 @@ module.exports = {
     updateOrderStatus,
     getMyOrders,
     getOrders,
+    cancelOrder,
 };

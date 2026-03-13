@@ -4,13 +4,13 @@ const ContactMessage = require('../models/ContactMessage');
 // @desc    Create contact message
 // @route   POST /api/contact
 // @access  Public
+const { validationResult } = require('express-validator');
 const createContactMessage = asyncHandler(async (req, res) => {
-    const { name, email, phone, subject, message } = req.body;
-
-    if (!name || !email || !message) {
-        res.status(400);
-        throw new Error('Name, email, and message are required');
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
     }
+    const { name, email, phone, subject, message } = req.body;
 
     const createdMessage = await ContactMessage.create({
         name,
